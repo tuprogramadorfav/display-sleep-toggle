@@ -108,12 +108,42 @@ func toggleMirroring() {
 }
 
 // Cmd + Brightness Down can't be a hot key: the built-in keyboard sends the brightness keys as key
-// codes 145 (down) and 144 (up) with fn held, and macOS acts on them before hot keys. A HID-level
-// event tap sees them first and swallows the presses it handles, so macOS doesn't also toggle
-// mirroring or step the brightness. Needs the Accessibility permission.
+// codes 145 (down) and 144 (up) with fn held, Apple's external keyboards send them as system-defined
+// media key events, and macOS acts on both before hot keys. A HID-level event tap sees them first
+// and swallows the presses it handles, so macOS doesn't also toggle mirroring or step the brightness.
+// Needs the Accessibility permission.
 let keyLog = Logger(subsystem: "io.github.tuprogramadorfav.DisplaySleepToggle", category: "keys")
 let brightnessDownKeyCode: Int64 = 145
 let brightnessUpKeyCode: Int64 = 144
+// NX_SYSDEFINED events of subtype NX_SUBTYPE_AUX_CONTROL_BUTTONS carry the media keys,
+// with NX_KEYTYPE_BRIGHTNESS_DOWN and NX_KEYTYPE_BRIGHTNESS_UP from IOKit's ev_keymap.h.
+let systemDefinedEventType: UInt32 = 14
+let auxControlButtonsSubtype: Int16 = 8
+let auxBrightnessDownKey = 3
+let auxBrightnessUpKey = 2
+
+struct BrightnessKeyEvent {
+    let isUp: Bool // the Brightness Up key, otherwise Brightness Down
+    let isDown: Bool // pressed, otherwise released
+    let isRepeat: Bool
+}
+
+// The brightness key in a key or media key event, from either keyboard.
+func brightnessKeyEvent(type: CGEventType, event: CGEvent) -> BrightnessKeyEvent? {
+    if type == .keyDown || type == .keyUp {
+        let code = event.getIntegerValueField(.keyboardEventKeycode)
+        guard code == brightnessDownKeyCode || code == brightnessUpKeyCode else { return nil }
+        return BrightnessKeyEvent(isUp: code == brightnessUpKeyCode, isDown: type == .keyDown,
+                                  isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0)
+    }
+    guard type.rawValue == systemDefinedEventType, let media = NSEvent(cgEvent: event),
+          media.subtype.rawValue == auxControlButtonsSubtype else { return nil }
+    // data1: key in the high 16 bits, then the key state (0x0A pressed, 0x0B released), then the repeat bit.
+    let key = (media.data1 & 0xFFFF0000) >> 16
+    guard key == auxBrightnessDownKey || key == auxBrightnessUpKey else { return nil }
+    return BrightnessKeyEvent(isUp: key == auxBrightnessUpKey, isDown: (media.data1 & 0xFF00) >> 8 == 0x0A,
+                              isRepeat: media.data1 & 0x1 != 0)
+}
 var brightnessKeyTap: CFMachPort?
 var brightnessKeyTapSource: CFRunLoopSource?
 var dimAction: (() -> Void)?
@@ -128,27 +158,28 @@ func installBrightnessKeyTap(dim: @escaping () -> Void, undoDim: @escaping () ->
     undoDimAction = undoDim
     guard let tap = CGEvent.tapCreate(
         tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
-        eventsOfInterest: CGEventMask(1 << CGEventType.keyDown.rawValue | 1 << CGEventType.keyUp.rawValue),
+        eventsOfInterest: CGEventMask(1 << CGEventType.keyDown.rawValue | 1 << CGEventType.keyUp.rawValue
+                                      | 1 << systemDefinedEventType),
         callback: { _, type, event, _ in
             let pass = Unmanaged.passUnretained(event)
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                 if let tap = brightnessKeyTap { CGEvent.tapEnable(tap: tap, enable: true) }
                 return pass
             }
-            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            guard let key = brightnessKeyEvent(type: type, event: event) else { return pass }
             let modifiers = event.flags.intersection([.maskCommand, .maskShift, .maskAlternate, .maskControl])
-            let isPress = type == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) == 0
+            let isPress = key.isDown && !key.isRepeat
             // The actions shell out to pmset, so they run after the callback returns.
-            if code == brightnessDownKeyCode && modifiers == .maskCommand {
+            if !key.isUp && modifiers == .maskCommand {
                 if isPress {
                     keyLog.debug("Cmd + Brightness Down")
                     DispatchQueue.main.async { dimAction?() }
                 }
                 return nil
             }
-            if code == brightnessUpKeyCode {
+            if key.isUp {
                 if swallowingBrightnessUp {
-                    if type == .keyUp { swallowingBrightnessUp = false }
+                    if !key.isDown { swallowingBrightnessUp = false }
                     return nil
                 }
                 if isPress && brightnessBeforeDim != nil && modifiers.subtracting(.maskCommand).isEmpty {
